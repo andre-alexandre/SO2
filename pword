@@ -1,0 +1,15 @@
+#!/bin/bash
+PYTHON="python3"
+PROGRAM="pword.py"
+
+if [ $# -lt 3 ]
+then echo "Error: Número de argumentos menor do que o necessário"
+exit
+fi
+
+if [ ! -f "$PROGRAM" ]
+then echo "Error: $PROGRAM não existe"
+exit
+fi
+
+${PYTHON} ${PROGRAM} $@
