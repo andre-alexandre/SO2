@@ -37,14 +37,21 @@ def parse_arguments(arg):
     parser = argparse.ArgumentParser(description="Parallel word search and count")
     parser.add_argument("-m", choices=["c", "l", "i"], default="c", help="Modo de contagem: c (total), l (linhas), i (isolado)")
     parser.add_argument("-p", type=int, default=1, help="Número de processos paralelos")
-    parser.add_argument("-i", type=int, default=3, help="Intervalo de tempo dos resultados parciais da execução")
+    parser.add_argument("-i", type=float, default=3, help="Intervalo de tempo dos resultados parciais da execução")
     parser.add_argument("-d", type=str, default=None, help="O ficheiro de destino da emissão dos resultados parciais")
     parser.add_argument("-w", required=True, help="Palavra a ser pesquisada")
     parser.add_argument("files", nargs="+", help="Lista de ficheiros")
     return parser.parse_args(arg)
 
 
+def controlC(signum, frame):
+    """
+    Signal handler for SIGINT (Ctrl+C).
+    """
 
+    global stop_processing
+    stop_processing = True
+    print("\nAborting execution...")
 
 
 def count_words(lines, word, mode):
@@ -62,18 +69,19 @@ def count_words(lines, word, mode):
     """
         
     total_count = 0
+
     for line in lines:
         if mode == "c":
-            # Modo "c": Contar todas as ocorrências da palavra
             total_count += line.count(word)
+
         elif mode == "l":
-            # Modo "l": Contar linhas que contêm a palavra
             if word in line:
                 total_count += 1
+
         elif mode == "i":
-            # Modo "i": Contar ocorrências isoladas da palavra
             words_in_line = line.split()
             total_count += words_in_line.count(word)
+
     return total_count
 
 
@@ -99,24 +107,22 @@ def split_file(filename, num_parts):
 
 
 
-def partial_results(interval, start_time, total_count, processed_count, remaining_count, log_file, lock):
-    while remaining_count.value > 0:
-        time.sleep(interval)
-        with lock:
-            timestamp = datetime.now().strftime("%d/%m/%Y-%H:%M:%S")
-            elapsed_time = int((time.time() - start_time) * 1e6)  # in microseconds
-            log_entry = f"{timestamp} {elapsed_time} {total_count.value} {processed_count.value} {remaining_count.value}\n"
-            if log_file:
-                with open(log_file, "a") as log:
-                    log.write(log_entry)
-            else:
-                sys.stdout.write(log_entry)
+def partial_results(file_results, start_time, occurrences, part, first_part):
+    timestamp = datetime.now().strftime("%d/%m/%Y-%H:%M:%S")
+    elapsed_time = int((time.time() - start_time) * 1e6)
+    entry = f"{timestamp} {elapsed_time} {occurrences.value} {first_part-part.value} {part.value}\n"
+
+    if file_results:
+        with open(file_results+".log", "a") as file:
+            file.write(entry)
+    else:
+        sys.stdout.write(entry)
 
 
 
 
 
-def prcs(lines, word, mode, shared_count, queue, lock, processed_count, remaining_count):
+def prcs(lines, word, mode, ocurrences, mutex, part):
     """
     Process a given list of text lines to count the occurrences of a specified word, 
     and print the result along with process and file information.
@@ -131,24 +137,32 @@ def prcs(lines, word, mode, shared_count, queue, lock, processed_count, remainin
     count = count_words(lines, word, mode)
 
     if mode == "c":
-        with lock:
-            shared_count.value += count
+        mutex.acquire()
+        ocurrences.value = ocurrences.value + count
+        part.value = part.value - 1
+        mutex.release()
+
+
     elif mode == "l":
-        queue.put(count)
-    elif mode == "i":
-        with lock:
-            shared_count.value += count
+        ocurrences.put(count)
+
+    # elif mode == "i":
+    #     with lock:
+    #         shared_count.value += count
 
     # Update counters for processed and remaining
-    with lock:
-        processed_count.value += 1
-        remaining_count.value -= 1
+    # with lock:
+    #     processed_count.value += 1
+    #     remaining_count.value -= 1
 
 
+def handler(file_results, start_time, ocurrences, part, first_part):
+    def inner_handler(signum, frame):
+        partial_results(file_results, start_time, ocurrences, part, first_part)
+    return inner_handler
 
 
-
-def distribute(files, word, mode, num_processes, shared_count, queue, lock, processed_count, remaining_count):
+def distribute(files, word, mode, num_processes, time_results, file_results, start_time, ocurrences, mutex):
     """
     Distributes file processing tasks across multiple processes for a word count operation.
     Requires:
@@ -170,41 +184,52 @@ def distribute(files, word, mode, num_processes, shared_count, queue, lock, proc
         - All processes are started and joined, ensuring completion before the function exits.
     """
 
+    global stop_processing
+    stop_processing = False
+    signal.signal(signal.SIGINT, controlC)
+
     processes = []
 
-    if len(files) == 1:  # Caso de apenas um arquivo
+    if len(files) == 1:
         filename = files
         file_parts = split_file(filename, num_processes)
+        first_part = len(file_parts)
+        part = Value("i", first_part)
         for i, lines in enumerate(file_parts):
-            process = Process(target=prcs, args=(lines, word, mode, shared_count, queue, lock, processed_count, remaining_count), name=i+1)
-            processes.append(process)
-            process.start()
+            if stop_processing == False:
+                process = Process(target=prcs, args=(lines, word, mode, ocurrences, mutex, part), name=i+1)
+                processes.append(process)
+                process.start()
+            else:
+                break
 
-    else:  # Caso de múltiplos arquivos
+    else: 
         file_groups = [files[i::num_processes] for i in range(num_processes)]
+        first_part = len(file_groups)
+        part = Value("i", first_part)
         for i, file_group in enumerate(file_groups):
-            lines = []
-            for filename in file_group:
-                with open(filename, 'r', encoding='utf-8') as file:
-                    lines.extend(file.readlines())
-            process = Process(target=prcs, args=(lines, ', '.join(file_group), word, mode, shared_count, queue, lock, processed_count, remaining_count), name=i+1)
-            processes.append(process)
-            process.start()
+            if stop_processing == False:
+                lines = []
+                for filename in file_group:
+                    with open(filename, 'r', encoding='utf-8') as file:
+                        lines.extend(file.readlines())
+                process = Process(target=prcs, args=(lines, ', '.join(file_group), word, mode, ocurrences, mutex), name=i+1)
+                processes.append(process)
+                process.start()
+            else:
+                break
+
+
+
+    signal.signal(signal.SIGALRM, handler(file_results, start_time, ocurrences, part, first_part))
+    signal.setitimer(signal.ITIMER_REAL, 0.000001, time_results)
+    # signal.setitimer(signal.ITIMER_REAL, 0.000001, 0.001)
+
 
     for p in processes:
         p.join()
 
-
-
-
-
-def exit(sig, frame, lock):
-    with lock:
-        print("End")
-        sys.exit(0)
-
-
-
+    return
 
 
 def main(args):
@@ -236,44 +261,46 @@ def main(args):
     start_time = time.time()
 
 
+
     print('Programa: pword.py')
     print('Argumentos: ', args, "\n")
 
 
-    lock = Lock()
-    total_count = Value("i", 0)
-    processed_count = Value("i", 0)
-    remaining_count = Value("i", num_processes)  
-    queue = Queue() if mode in ["l", "i"] else None
+    # def controlCativo(sig, NULL):
+    #     print("\nPrograma está!")
+    #     sys.exit(0)
+    
+    # def controlCpassivo(sig, NULL):
+    #     print("\nPrograma será interrompido quando os processos atualmente em funcionamento terminarem!")
+    #     time.sleep(10)
+    #     controlCativo(sig, NULL)
+        
 
-
-    signal.signal(signal.SIGINT, lambda sig, frame: exit(sig, frame, lock))
-
-
-    if time_results:
-        Process(
-            target=partial_results,
-            args=(time_results, start_time, total_count, processed_count, remaining_count, file_results, lock),
-        ).start()
+    # signal.signal(signal.SIGINT, controlCpassivo)
 
 
     if len(files) < num_processes and len(files)!=1:
         num_processes = len(files)
 
-    distribute(files, word, mode, num_processes, total_count, queue, lock, processed_count, remaining_count)
 
+    if mode == "c":
+        ocurrences = Value("i", 0)
+        mutex = Lock()
 
-    if mode == "l":
-        all_lines = set()
-        while not queue.empty():
-            all_lines.update(queue.get())
-        print(f"Total lines: {len(all_lines)}")
+        distribute(files, word, mode, num_processes, time_results, file_results, start_time, ocurrences, mutex)
+        sys.stdout.write(f"Total occurrences: {ocurrences.value}\n")
 
-    elif mode == "i":
-        print(f"Total isolated occurrences: {total_count.value}")
+    elif mode == "l":
+        ocurrences = Queue()
+
+        distribute(files, word, mode, num_processes, time_results, file_results, start_time, ocurrences, None)
+        print(f"Total lines: {ocurrences.value}")
 
     else:
-        print(f"Total occurrences: {total_count.value}")
+        distribute(files, word, mode, num_processes, time_results, file_results)
+        print(f"Total isolated occurrences: {total_count.value}")
+
+
 
 
 
