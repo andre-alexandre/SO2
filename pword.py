@@ -19,7 +19,7 @@ def parse_arguments(arg):
         - `arg` should include:
             - `-m` with a value of "c", "l", or "i" (optional, defaults to "c"),
             - `-p` with a positive integer specifying the number of parallel processes (optional, defaults to 1),
-            - `-i` with a positive integer specifying the time of the interval between the partial results of execution (optional, defaults to 3),
+            - `-i` with a positive float specifying the time of the interval between the partial results of execution (optional, defaults to 3),
             - `-d` with a non-empty string representing the file to write the partial results (optional, defaults to stdout),
             - `-w` with a non-empty string representing the word to search (required),
             - One or more file paths for the positional `files` argument (required).
@@ -44,14 +44,25 @@ def parse_arguments(arg):
     return parser.parse_args(arg)
 
 
-def controlC(signum, frame):
-    """
-    Signal handler for SIGINT (Ctrl+C).
-    """
 
+
+
+def controlC(signum, frame):
     global stop_processing
     stop_processing = True
-    print("\nAborting execution...")
+    print("\nWill stop processing!")
+
+
+
+
+
+def handler(mode, file_results, start_time, ocurrencesV, ocurrencesQ, ocurrencesA, part, first_part):
+    def inner_handler(signum, frame):
+        partial_results(mode, file_results, start_time, ocurrencesV, ocurrencesQ, ocurrencesA, part, first_part)
+    return inner_handler
+
+
+
 
 
 def count_words(lines, word, mode):
@@ -69,6 +80,9 @@ def count_words(lines, word, mode):
     """
         
     total_count = 0
+    full_linesL = set()
+    full_linesI = 0
+
 
     for line in lines:
         if mode == "c":
@@ -77,12 +91,16 @@ def count_words(lines, word, mode):
         elif mode == "l":
             if word in line:
                 total_count += 1
+                full_linesL.add(line)
+                
 
         elif mode == "i":
             words_in_line = line.split()
             total_count += words_in_line.count(word)
+            full_linesI += words_in_line.count(word)
 
-    return total_count
+
+    return total_count, full_linesL, full_linesI
 
 
 
@@ -107,10 +125,19 @@ def split_file(filename, num_parts):
 
 
 
-def partial_results(file_results, start_time, occurrences, part, first_part):
+def partial_results(mode, file_results, start_time, occurrencesV, ocurrencesQ, ocurrencesA, part, first_part):
+    """
+    This function prints or writes the current state of the program.
+
+    """
+
     timestamp = datetime.now().strftime("%d/%m/%Y-%H:%M:%S")
     elapsed_time = int((time.time() - start_time) * 1e6)
-    entry = f"{timestamp} {elapsed_time} {occurrences.value} {first_part-part.value} {part.value}\n"
+
+    if mode == "c":
+        entry = f"{timestamp} {elapsed_time} {occurrencesV.value} {first_part-part.value} {part.value}\n"
+    else:
+        entry = f"{timestamp} {elapsed_time} {sum(ocurrencesA)} {first_part-part.value} {part.value}\n"
 
     if file_results:
         with open(file_results+".log", "a") as file:
@@ -122,7 +149,7 @@ def partial_results(file_results, start_time, occurrences, part, first_part):
 
 
 
-def prcs(lines, word, mode, ocurrences, mutex, part):
+def prcs(lines, filename, word, mode, ocurrencesV, mutex, ocurrencesQ, ocurrencesA, part, first_part):
     """
     Process a given list of text lines to count the occurrences of a specified word, 
     and print the result along with process and file information.
@@ -131,20 +158,42 @@ def prcs(lines, word, mode, ocurrences, mutex, part):
         - filename must be a non-empty string .
         - word must be a non-empty string .
         - mode must be 'c','i' or 'l'.
+        - ocurrencesV, mutex, ocurrencesQ, ocurrencesA and part  are multiprocessing.Value, Lock, Queue, Array and Value respectively.
+        - first_part is a string.
     Ensures:
-        - Counts the occurrences of word in lines according to the specified `mode` 
+        - Counts the occurrences of word in lines according to the specified `mode` and updates the multiprocessing variables.
     """
     count = count_words(lines, word, mode)
 
     if mode == "c":
+        countV = count[0]
         mutex.acquire()
-        ocurrences.value = ocurrences.value + count
+        ocurrencesV.value = ocurrencesV.value + countV
         part.value = part.value - 1
         mutex.release()
 
 
     elif mode == "l":
-        ocurrences.put(count)
+        countA = count[0]
+        full_lines = count[1]
+        ocurrencesQ.put(full_lines)
+        mutex.acquire()
+        ocurrencesA[first_part-part.value] = countA
+        part.value = part.value - 1
+        mutex.release()
+
+    else:
+        countA = count[0]
+        full_lines = count[2]
+        ocurrencesQ.put(full_lines)
+        mutex.acquire()
+        ocurrencesA[first_part-part.value] = countA
+        part.value = part.value - 1
+        mutex.release()
+
+
+
+
 
     # elif mode == "i":
     #     with lock:
@@ -156,13 +205,10 @@ def prcs(lines, word, mode, ocurrences, mutex, part):
     #     remaining_count.value -= 1
 
 
-def handler(file_results, start_time, ocurrences, part, first_part):
-    def inner_handler(signum, frame):
-        partial_results(file_results, start_time, ocurrences, part, first_part)
-    return inner_handler
 
 
-def distribute(files, word, mode, num_processes, time_results, file_results, start_time, ocurrences, mutex):
+
+def distribute(files, word, mode, num_processes, time_results, file_results, start_time, ocurrencesV, mutex, ocurrencesQ, ocurrencesA):
     """
     Distributes file processing tasks across multiple processes for a word count operation.
     Requires:
@@ -173,6 +219,8 @@ def distribute(files, word, mode, num_processes, time_results, file_results, sta
             - "l" for counting lines containing `word` at least once,
             - "i" for counting isolated occurrences of `word` as a distinct word in each line.
         - `num_processes` is a positive integer, specifying the number of processes for parallel execution,
+        - `time_results` with a positive float specifying the time of the interval between the partial results of execution,
+        - `file_results` with a non-empty string representing the file to write the partial results(optional, defaults to stdout),
 
     Ensures:
         - Distributes the task of counting `word` occurrences across up to `num_processes` parallel processes.
@@ -190,6 +238,11 @@ def distribute(files, word, mode, num_processes, time_results, file_results, sta
 
     processes = []
 
+    global sumQ
+    sumQ = 0
+    global totalQ
+    totalQ = []
+
     if len(files) == 1:
         filename = files
         file_parts = split_file(filename, num_processes)
@@ -197,9 +250,13 @@ def distribute(files, word, mode, num_processes, time_results, file_results, sta
         part = Value("i", first_part)
         for i, lines in enumerate(file_parts):
             if stop_processing == False:
-                process = Process(target=prcs, args=(lines, word, mode, ocurrences, mutex, part), name=i+1)
+                process = Process(target=prcs, args=(lines, filename, word, mode, ocurrencesV, mutex, ocurrencesQ, ocurrencesA, part, first_part), name=i+1)
                 processes.append(process)
                 process.start()
+
+                if mode == "l" or mode == "i":
+                    totalQ.append(ocurrencesQ.get())
+
             else:
                 break
 
@@ -213,23 +270,37 @@ def distribute(files, word, mode, num_processes, time_results, file_results, sta
                 for filename in file_group:
                     with open(filename, 'r', encoding='utf-8') as file:
                         lines.extend(file.readlines())
-                process = Process(target=prcs, args=(lines, ', '.join(file_group), word, mode, ocurrences, mutex), name=i+1)
+                process = Process(target=prcs, args=(lines, ', '.join(file_group), word, mode, ocurrencesV, mutex, ocurrencesQ, ocurrencesA, part, first_part), name=i+1)
                 processes.append(process)
                 process.start()
+
+                if mode == "l" or mode == "i":
+                    totalQ.append(ocurrencesQ.get())
+
             else:
                 break
 
 
+    if mode == "l":
+        for i in totalQ:
+            sumQ = sumQ + len(i)
 
-    signal.signal(signal.SIGALRM, handler(file_results, start_time, ocurrences, part, first_part))
+    if mode == "i":
+        for i in totalQ:
+            sumQ = sumQ + i
+
+
+    signal.signal(signal.SIGALRM, handler(mode, file_results, start_time, ocurrencesV, ocurrencesQ, ocurrencesA, part, first_part))
     signal.setitimer(signal.ITIMER_REAL, 0.000001, time_results)
-    # signal.setitimer(signal.ITIMER_REAL, 0.000001, 0.001)
 
 
     for p in processes:
         p.join()
 
     return
+
+
+
 
 
 def main(args):
@@ -257,26 +328,10 @@ def main(args):
     time_results = args.i
     file_results = args.d
 
-
     start_time = time.time()
-
-
 
     print('Programa: pword.py')
     print('Argumentos: ', args, "\n")
-
-
-    # def controlCativo(sig, NULL):
-    #     print("\nPrograma está!")
-    #     sys.exit(0)
-    
-    # def controlCpassivo(sig, NULL):
-    #     print("\nPrograma será interrompido quando os processos atualmente em funcionamento terminarem!")
-    #     time.sleep(10)
-    #     controlCativo(sig, NULL)
-        
-
-    # signal.signal(signal.SIGINT, controlCpassivo)
 
 
     if len(files) < num_processes and len(files)!=1:
@@ -284,23 +339,28 @@ def main(args):
 
 
     if mode == "c":
-        ocurrences = Value("i", 0)
+        ocurrencesV = Value("i", 0)
         mutex = Lock()
 
-        distribute(files, word, mode, num_processes, time_results, file_results, start_time, ocurrences, mutex)
-        sys.stdout.write(f"Total occurrences: {ocurrences.value}\n")
+        distribute(files, word, mode, num_processes, time_results, file_results, start_time, ocurrencesV, mutex, None, None)
+        sys.stdout.write(f"Total occurrences: {ocurrencesV.value}\n")
 
     elif mode == "l":
-        ocurrences = Queue()
+        ocurrencesQ = Queue()
+        ocurrencesA = Array("i", num_processes)
+        mutex = Lock()
+        distribute(files, word, mode, num_processes, time_results, file_results, start_time, None, mutex, ocurrencesQ, ocurrencesA)
+        sys.stdout.write(f"Total lines (Array): {sum(ocurrencesA)}")
+        sys.stdout.write(f"Total lines (Queue): {sumQ}")
 
-        distribute(files, word, mode, num_processes, time_results, file_results, start_time, ocurrences, None)
-        print(f"Total lines: {ocurrences.value}")
 
     else:
-        distribute(files, word, mode, num_processes, time_results, file_results)
-        print(f"Total isolated occurrences: {total_count.value}")
-
-
+        ocurrencesQ = Queue()
+        ocurrencesA = Array("i", num_processes)
+        mutex = Lock()
+        distribute(files, word, mode, num_processes, time_results, file_results, start_time, None, mutex, ocurrencesQ, ocurrencesA)
+        sys.stdout.write(f"Total isolated occurrences (Array): {sum(ocurrencesA)}")
+        sys.stdout.write(f"Total isolated occurrences (Queue): {sumQ}")
 
 
 
